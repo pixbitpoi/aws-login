@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# エディタ・ツールのローカル設定
+.claude/settings.local.json
+.vscode/
+.idea/
+
+# テストの一時ファイル（通常は TMPDIR に作られるが念のため）
+aws-login-test.*

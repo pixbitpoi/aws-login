@@ -1,0 +1,755 @@
+#!/usr/bin/env bash
+#
+# aws-login — AWS の認証方式（MFA / SSO）を判定し、未設定なら対話で準備し、
+# 有効な認証情報を再利用または更新してから、必要に応じて後続コマンドを実行する。
+#
+# 処理の流れは main() を参照。詳しい仕様は docs/internals.md にある。
+
+set -euo pipefail
+
+
+#--- 共通ユーティリティ -------------------------------------------------------
+
+usage() {
+  cat <<USAGE
+使用方法: ${0##*/} [mfa|sso] [オプション] [-- コマンド 引数...]
+  --profile NAME         対象 (省略時は環境変数、なければ質問。空 Enter で default)
+  --output-profile NAME  MFA 保存先 (既定: <元>-mfa)
+  --mfa-serial SERIAL    MFA デバイス
+  --region REGION        リージョン
+  --duration-seconds N   MFA セッション期間
+  --use-device-code     SSO デバイスコード方式
+  --no-browser          SSO ブラウザ自動起動を抑止
+  --refresh             キャッシュを使わず再ログイン
+  -h, --help            ヘルプ
+
+方式を省略すると設定から判定し、未設定なら対話で準備します。
+SSO を指定・選択した場合は名前に -sso を追加します（既に付いていれば追加しません）。
+AWS 側のユーザー・MFA 登録・SSO 権限割り当ては事前に必要です。
+例: ${0##*/} --profile dev -- aws s3 ls
+USAGE
+}
+
+# 端末がなければ、足りない設定を伝えて終了する。対話入力の前に必ず呼ぶ。
+require_terminal() {
+  [[ -t 0 ]] || fail "設定が不足しています。端末から再実行してください: $*"
+}
+
+# プロファイルの設定値を取り出す。未設定なら空文字を返す。
+# 引数名を target にしているのは、グローバルの profile を隠さないため。
+config_get() {
+  local key=$1 target=$2
+  aws configure get "$key" --profile "$target" 2>/dev/null || true
+}
+
+# 指定した項目のいずれかに値があれば真を返す。
+config_has_any() {
+  local target=$1 key
+  shift
+  for key in "$@"; do
+    [[ -z "$(config_get "$key" "$target")" ]] || return 0
+  done
+  return 1
+}
+
+
+#--- 表示 ---------------------------------------------------------------------
+# 経過はすべて標準エラーへ出す。標準出力は後続コマンドのために空けておく。
+# 例外は show_command_hint（後続コマンドを指定しなかったときの案内）だけ。
+#
+# 記号・色・字下げの規則は docs/internals.md「表示の規則」が正本。ここでは部品を定義するだけで、
+# 独自の記号や printf を各所に足さない。色は標準エラーが端末で NO_COLOR が無いときだけ付く。
+
+ui_tty=0
+c_bold='' c_dim='' c_cyan='' c_green='' c_yellow='' c_red='' c_reset=''
+if [[ -t 2 ]]; then
+  ui_tty=1
+  if [[ -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then
+    c_bold=$'\033[1m' c_dim=$'\033[2m' c_cyan=$'\033[36m' c_green=$'\033[32m'
+    c_yellow=$'\033[33m' c_red=$'\033[31m' c_reset=$'\033[0m'
+  fi
+fi
+
+label_width=18
+
+# 表示幅。3 バイト文字（日本語）を幅 2 とみなす。
+ui_width() {
+  local chars bytes
+  chars=${#1}
+  bytes=$(LC_ALL=C; printf '%s' "$1" | wc -c | tr -d ' ')
+  printf '%s' "$(( chars + (bytes - chars) / 2 ))"
+}
+
+# ラベルを幅 label_width に揃える。
+ui_pad() {
+  local pad
+  pad=$(( label_width - $(ui_width "$1") ))
+  (( pad >= 2 )) || pad=2
+  printf '%s%*s' "$1" "$pad" ''
+}
+
+ui_title() { printf '%s◆ %s%s\n' "$c_bold" "$1" "$c_reset" >&2; }
+ui_text()  { printf '    %s%s%s\n' "$c_dim" "$1" "$c_reset" >&2; }
+
+# ラベルと値の 1 行。ui_kv <ラベル> <値>
+ui_kv() { printf '    %s%s%s%s\n' "$c_dim" "$(ui_pad "$1")" "$c_reset" "$2" >&2; }
+
+# 済んだこと。ui_ok <文> または ui_ok <ラベル> <値>
+ui_ok() {
+  if (( $# >= 2 )); then
+    printf '  %s✔%s %s%s%s%s\n' "$c_green" "$c_reset" "$(ui_pad "$1")" "$c_bold" "$2" "$c_reset" >&2
+  else
+    printf '  %s✔%s %s\n' "$c_green" "$c_reset" "$1" >&2
+  fi
+}
+
+# これから行うこと。ui_step <ラベル> [値]
+ui_step() {
+  if (( $# >= 2 )); then
+    printf '  %s●%s %s%s%s%s\n' "$c_cyan" "$c_reset" "$c_bold" "$(ui_pad "$1")" "$c_reset" "$2" >&2
+  else
+    printf '  %s●%s %s%s%s\n' "$c_cyan" "$c_reset" "$c_bold" "$1" "$c_reset" >&2
+  fi
+}
+
+# 生の出力（AWS CLI のエラー文など）を薄く字下げして見せる。
+ui_raw() {
+  printf '%s\n' "$1" | sed "s/^/      ${c_dim}/; s/\$/${c_reset}/" >&2
+}
+
+# 直前の n 行を消して、カーソルをその先頭に置く（端末のときだけ）。
+ui_erase() {
+  (( ui_tty )) || return 0
+  printf '\033[%dA\033[J' "$1" >&2
+}
+
+fail() {
+  printf '  %s✗ %s%s\n' "$c_red" "$*" "$c_reset" >&2
+  exit 2
+}
+
+# 1 行の入力を求める。ask <変数名> <ラベル> [既定]。既定を受けるときは Enter。
+# 入力が中断されたら 1 を返す。端末では答えた後に ❯ の行を ✔ の 1 行へ畳む。
+ask() {
+  local var=$1 label=$2 def=${3:-} ans
+  if [[ -n "$def" ]]; then
+    printf '  %s❯%s %s %s(%s)%s: ' "$c_cyan" "$c_reset" "$label" "$c_dim" "$def" "$c_reset" >&2
+  else
+    printf '  %s❯%s %s: ' "$c_cyan" "$c_reset" "$label" >&2
+  fi
+  read -r ans || { printf '\n' >&2; return 1; }
+  ans=${ans:-$def}
+  printf -v "$var" '%s' "$ans"
+  [[ -n "$ans" ]] || return 0
+  ui_erase 1
+  ui_ok "$label" "$ans"
+}
+
+# 候補から矢印キーか番号で選ぶ。choose_menu <質問> <ラベル> <候補...>。結果は menu_choice（0 始まり）。
+# 呼ぶ前に menu_choice へ初期カーソル、menu_hotkeys へ候補ごとの直接選択キーを入れておける。
+# 候補は「名前<TAB>説明」の形でもよい。↑↓ / j k で移動、1〜9 で番号へ、Enter で決定、q または Ctrl-D で中断。
+# 決定後はメニューを消して ✔ の 1 行に畳む。描画は ANSI（色・カーソル移動・消去）だけで行う。
+menu_choice=0
+menu_hotkeys=()
+choose_menu() {
+  local question=$1 label=$2
+  shift 2
+  local -a entries=("$@")
+  local count=${#entries[@]} cursor=$menu_choice i key rest
+
+  draw_menu() {
+    local i name desc
+    for i in "${!entries[@]}"; do
+      name=${entries[i]%%$'\t'*}
+      desc=${entries[i]#*$'\t'}
+      [[ "$desc" != "${entries[i]}" ]] || desc=
+      if (( i == cursor )); then
+        printf '\033[K    %s❯ %s%s' "$c_cyan" "$name" "$c_reset" >&2
+      else
+        printf '\033[K    %s  %s%s' "$c_dim" "$name" "$c_reset" >&2
+      fi
+      [[ -z "$desc" ]] || printf '  %s%s%s' "$c_dim" "$desc" "$c_reset" >&2
+      printf '\n' >&2
+    done
+    printf '\033[K    %s↑↓ 移動 · 番号で選択 · Enter 決定 · q 中断%s\n' "$c_dim" "$c_reset" >&2
+  }
+  show_cursor() { printf '\033[?25h' >&2; }
+  trap show_cursor EXIT
+  printf '\033[?25l' >&2
+
+  printf '  %s❯%s %s\n' "$c_cyan" "$c_reset" "$question" >&2
+  draw_menu
+  while :; do
+    IFS= read -rsn1 key || fail "${label}の選択が中断されました。"
+    case "$key" in
+      $'\e')
+        read -rsn2 -t 0.2 rest || rest=
+        case "$rest" in
+          '[A') (( cursor > 0 )) && cursor=$(( cursor - 1 )) ;;
+          '[B') (( cursor < count - 1 )) && cursor=$(( cursor + 1 )) ;;
+        esac
+        ;;
+      k) (( cursor > 0 )) && cursor=$(( cursor - 1 )) ;;
+      j) (( cursor < count - 1 )) && cursor=$(( cursor + 1 )) ;;
+      [1-9]) (( key <= count )) && cursor=$(( key - 1 )) ;;
+      '') break ;;
+      q) fail "${label}の選択が中断されました。" ;;
+      *)
+        for i in "${!menu_hotkeys[@]}"; do
+          [[ "$key" != "${menu_hotkeys[i]}" ]] || cursor=$i
+        done
+        ;;
+    esac
+    printf '\033[%dA' "$(( count + 1 ))" >&2
+    draw_menu
+  done
+
+  menu_choice=$cursor
+  menu_hotkeys=()
+  # 質問 + 候補 + ヒントを消して、結果 1 行に畳む
+  ui_erase "$(( count + 2 ))"
+  ui_ok "$label" "${entries[cursor]%%$'\t'*}"
+  show_cursor
+  trap - EXIT
+}
+
+
+#--- 引数と環境変数 -----------------------------------------------------------
+
+mode=auto                                        # auto / mfa / sso
+profile=${AWS_PROFILE:-${AWS_SSO_PROFILE:-}}     # 認証設定を読む元のプロファイル
+output_profile=${AWS_MFA_PROFILE:-}              # MFA の一時認証情報の保存先
+mfa_serial=${AWS_MFA_SERIAL:-}
+region=${AWS_REGION:-${AWS_DEFAULT_REGION:-}}
+duration=
+refresh=0
+sso_options=()                                   # aws sso login / configure sso へ渡す
+command_args=()                                  # -- の後に指定された後続コマンド
+
+parse_arguments() {
+  # 先頭の位置引数だけが方式の明示指定。
+  case "${1:-}" in
+    mfa|sso)
+      mode=$1
+      shift
+      ;;
+  esac
+
+  while (( $# )); do
+    case "$1" in
+      --profile|--output-profile|--mfa-serial|--region|--duration-seconds)
+        [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || fail "$1 に値が必要です。"
+        case "$1" in
+          --profile)          profile=$2 ;;
+          --output-profile)   output_profile=$2 ;;
+          --mfa-serial)       mfa_serial=$2 ;;
+          --region)           region=$2 ;;
+          --duration-seconds) duration=$2 ;;
+        esac
+        shift 2
+        ;;
+
+      --use-device-code|--no-browser)
+        sso_options+=("$1")
+        shift
+        ;;
+
+      --refresh)
+        refresh=1
+        shift
+        ;;
+
+      --)
+        shift
+        (( $# )) || fail '-- の後にコマンドが必要です。'
+        command_args=("$@")
+        break
+        ;;
+
+      -h|--help)
+        usage
+        exit 0
+        ;;
+
+      *)
+        fail "不明な引数: $1"
+        ;;
+    esac
+  done
+}
+
+# 呼び出し元の認証情報は引き継がず、選択したプロファイルだけを使う。
+# 親シェルの環境は変更しない（このスクリプトはあくまで子プロセス）。
+isolate_credentials() {
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
+        AWS_SECURITY_TOKEN AWS_SESSION_EXPIRATION
+  unset AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_ROLE_SESSION_NAME
+
+  export AWS_PAGER="" AWS_CLI_AUTO_PROMPT=off
+}
+
+
+#--- プロファイルの決定 -------------------------------------------------------
+
+# 「認証設定がある」とみなす項目。region / output だけの設定は初期化とみなさない。
+credential_fields=(
+  aws_access_key_id aws_secret_access_key aws_session_token
+  mfa_serial sso_session sso_start_url role_arn credential_process
+)
+
+# 認証方式をメニューで確定する。s / m でも直接選べる。
+ask_mode() {
+  menu_choice=0
+  menu_hotkeys=(s m)
+  choose_menu '認証方式を選んでください' '認証方式' \
+    $'sso\tIAM Identity Center。ブラウザでログインする' \
+    $'mfa\tIAM ユーザーの長期アクセスキー + MFA コード'
+  case "$menu_choice" in
+    0) mode=sso ;;
+    1) mode=mfa ;;
+  esac
+}
+
+# SSO では名前に -sso を付けて MFA 用の設定と分ける。既に付いていれば重ねない。
+apply_sso_suffix() {
+  if [[ "$mode" == sso && "$profile" != *-sso ]]; then
+    profile="${profile}-sso"
+  fi
+}
+
+# 名前が指定されていなければ対話で決める。設定済みの一覧があれば選択式、なければ入力式。
+# 端末がなければ質問できないので、default に認証設定がある場合だけそれを使う。
+asked_profile=0
+new_profile_entry='新しい名前を入力'
+
+resolve_profile() {
+  [[ -z "$profile" ]] || return 0
+
+  if [[ ! -t 0 ]]; then
+    profile=default
+    config_has_any "$profile" "${credential_fields[@]}" ||
+      require_terminal 'プロファイル名を --profile NAME で指定してください。'
+    return 0
+  fi
+
+  choose_profile_from_list
+  if [[ -z "$profile" ]]; then
+    ask profile 'プロファイル名' default || fail 'プロファイル名の入力が中断されました。'
+    [[ "$profile" != -* ]] || fail '有効なプロファイル名を入力してください。'
+  fi
+  asked_profile=1
+}
+
+# 設定済みのプロファイル一覧から矢印キーまたは番号で選ぶ。
+# -mfa で終わる名前は一時認証情報の保存先なので隠す。-sso はそのまま選べる。
+# 一覧が空なら何もしない。「新しい名前を入力」を選ぶと profile は空のまま返す。
+choose_profile_from_list() {
+  local -a entries=()
+  local name i
+  while IFS= read -r name; do
+    [[ -n "$name" && "$name" != *-mfa ]] || continue
+    entries+=("$name")
+  done < <(aws configure list-profiles 2>/dev/null || true)
+  (( ${#entries[@]} )) || return 0
+  entries+=("$new_profile_entry")
+
+  # 初期カーソルは default があればそこ、なければ先頭。
+  menu_choice=0
+  for i in "${!entries[@]}"; do
+    [[ "${entries[i]}" != default ]] || menu_choice=$i
+  done
+  choose_menu 'プロファイルを選んでください' 'プロファイル' "${entries[@]}"
+
+  if (( menu_choice < ${#entries[@]} - 1 )); then
+    profile=${entries[menu_choice]}
+  fi
+}
+
+
+#--- 認証方式の判定 -----------------------------------------------------------
+
+sso_session=
+sso_start_url=
+configured_serial=
+
+load_profile_settings() {
+  sso_session=$(config_get sso_session "$profile")
+  sso_start_url=$(config_get sso_start_url "$profile")
+  configured_serial=$(config_get mfa_serial "$profile")
+
+  if config_has_any "$profile" role_arn credential_process; then
+    fail 'AssumeRole / credential_process プロファイルは対象外です。元の MFA または SSO プロファイルを指定してください。'
+  fi
+}
+
+# 設定から方式を推測する。判定できなければ空文字を返す。
+detect_mode() {
+  if [[ -n "$sso_session$sso_start_url" ]]; then
+    printf 'sso'
+  elif [[ -n "$configured_serial$mfa_serial" ]]; then
+    printf 'mfa'
+  fi
+}
+
+resolve_mode() {
+  local detected
+  detected=$(detect_mode)
+
+  # 明示指定があれば、設定と食い違っていないかだけを確かめる。
+  if [[ "$mode" != auto ]]; then
+    if [[ -n "$detected" && "$mode" != "$detected" ]]; then
+      fail "設定済みの方式は ${detected} です。別のプロファイルを指定してください。"
+    fi
+    return 0
+  fi
+
+  mode=$detected
+  [[ -z "$mode" ]] || return 0
+
+  require_terminal "${profile} の認証方式"
+  ask_mode
+
+  # SSO を選ぶと対象が <名前>-sso に変わる。名前が変わったら設定を読み直す。
+  local previous=$profile
+  apply_sso_suffix
+  [[ "$profile" != "$previous" ]] || return 0
+
+  sso_session=$(config_get sso_session "$profile")
+  sso_start_url=$(config_get sso_start_url "$profile")
+
+  if config_has_any "$profile" role_arn credential_process mfa_serial; then
+    fail "保存先 ${profile} は他の認証方式で使用中です。"
+  fi
+}
+
+
+#--- SSO の準備 ---------------------------------------------------------------
+
+prepare_sso() {
+  [[ -z "$output_profile$mfa_serial$duration" ]] ||
+    fail 'MFA 専用オプション・環境変数は SSO に使えません。'
+
+  if config_has_any "$profile" aws_access_key_id aws_secret_access_key aws_session_token; then
+    fail "保存先 ${profile} にアクセスキーがあります。別のプロファイルを指定してください。"
+  fi
+
+  # 未設定なら AWS CLI のウィザードに任せる。
+  if [[ -z "$sso_session$sso_start_url" ]]; then
+    require_terminal 'SSO の設定'
+    ui_step 'SSO を設定します' "$profile"
+    ui_text 'AWS CLI のウィザードに答えてください。開始 URL とリージョンは管理者か招待メールで確認します。'
+    aws configure sso --profile "$profile" "${sso_options[@]}" >&2
+  fi
+
+  effective_profile=$profile
+}
+
+
+#--- MFA の準備 ---------------------------------------------------------------
+
+prepare_mfa() {
+  (( ${#sso_options[@]} == 0 )) || fail 'SSO 専用オプションは MFA に使えません。'
+
+  output_profile=${output_profile:-${profile}-mfa}
+  [[ "$output_profile" != "$profile" ]] || fail '元と保存先は別のプロファイル名にしてください。'
+
+  ensure_output_profile_is_free
+  ensure_long_term_access_keys
+  ensure_mfa_serial
+
+  # 明示されたデバイス・期間は、新しいセッションを取り直して初めて反映される。
+  if [[ "$mfa_serial" != "$configured_serial" || -n "$duration" ]]; then
+    refresh=1
+  fi
+
+  effective_profile=$output_profile
+}
+
+# 一時認証情報の保存先に、他方式の設定や長期キーが混ざらないようにする。
+ensure_output_profile_is_free() {
+  if config_has_any "$output_profile" role_arn credential_process sso_session sso_start_url; then
+    fail "保存先 ${output_profile} は他の認証方式で使用中です。"
+  fi
+
+  if [[ -n "$(config_get aws_access_key_id "$output_profile")" &&
+        -z "$(config_get aws_session_token "$output_profile")" ]]; then
+    fail "保存先 ${output_profile} に長期アクセスキーがあります。別の保存先を指定してください。"
+  fi
+}
+
+# 元プロファイルに IAM ユーザーの長期アクセスキーがあることを確かめる。
+ensure_long_term_access_keys() {
+  [[ -z "$(config_get aws_session_token "$profile")" ]] ||
+    fail '元プロファイルには長期アクセスキーが必要です。'
+
+  if [[ -n "$(config_get aws_access_key_id "$profile")" &&
+        -n "$(config_get aws_secret_access_key "$profile")" ]]; then
+    return 0
+  fi
+
+  require_terminal 'IAM ユーザーの長期アクセスキー設定'
+  ui_step 'アクセスキーを設定します' "$profile"
+  ui_text 'IAM ユーザーの長期アクセスキーを AWS CLI のウィザードに入力します。'
+  aws configure --profile "$profile" >&2
+
+  if [[ -z "$(config_get aws_access_key_id "$profile")" ||
+        -z "$(config_get aws_secret_access_key "$profile")" ]]; then
+    fail 'アクセスキーの設定が完了していません。'
+  fi
+}
+
+# 使用する MFA デバイスを決める。未設定なら質問して元プロファイルに保存する。
+ensure_mfa_serial() {
+  mfa_serial=${mfa_serial:-$configured_serial}
+  [[ -z "$mfa_serial" ]] || return 0
+
+  require_terminal '登録済み MFA デバイスの ARN / シリアル番号'
+  ask mfa_serial '登録済み MFA デバイスの ARN / シリアル番号' ||
+    fail 'MFA デバイスの入力が中断されました。'
+  [[ -n "$mfa_serial" ]] || fail 'MFA デバイスが必要です。'
+
+  aws configure set mfa_serial "$mfa_serial" --profile "$profile"
+}
+
+
+#--- 認証の確認とログイン -----------------------------------------------------
+
+effective_profile=          # 実際に接続に使うプロファイル
+common_options=()           # すべての aws 呼び出しに付ける共通オプション
+identity=
+needs_login=0
+
+# 認証情報の期限切れ・キャッシュなしを示すメッセージ。
+# 通信エラーや権限エラーをここに含めると、期限切れと誤認してしまう。
+expired_messages=(
+  'ExpiredToken'
+  'InvalidClientTokenId'
+  'UnauthorizedSSOTokenError'
+  'Token has expired'
+  'Token does not exist'
+  'Error loading SSO Token'
+  'SSO session associated'
+  'Unable to locate credentials'
+)
+
+is_expired_error() {
+  local error=$1 message
+  for message in "${expired_messages[@]}"; do
+    [[ "$error" != *"$message"* ]] || return 0
+  done
+  return 1
+}
+
+# 手元の認証情報がそのまま使えるかを STS で確かめる。
+verify_current_identity() {
+  needs_login=$refresh
+
+  # MFA は保存先にセッショントークンがなければ、確認するまでもない。
+  if [[ "$mode" == mfa && -z "$(config_get aws_session_token "$effective_profile")" ]]; then
+    needs_login=1
+  fi
+  (( needs_login == 0 )) || return 0
+
+  if identity=$(aws sts get-caller-identity --profile "$effective_profile" \
+                  "${common_options[@]}" --output json 2>&1); then
+    ui_ok '認証情報を再利用' "$effective_profile"
+    return 0
+  fi
+
+  if is_expired_error "$identity"; then
+    needs_login=1
+    return 0
+  fi
+
+  ui_raw "$identity"
+  fail '認証確認に失敗しました。接続・設定を確認してください。'
+}
+
+login_if_needed() {
+  (( needs_login )) || return 0
+
+  if [[ "$mode" == sso ]]; then
+    ui_step 'SSO でログインします' "$profile"
+    aws sso login --profile "$profile" "${common_options[@]}" "${sso_options[@]}" >&2
+  else
+    ui_step 'MFA でログインします' "$profile"
+    run_mfa_login
+  fi
+
+  identity=$(aws sts get-caller-identity --profile "$effective_profile" \
+               "${common_options[@]}" --output json)
+  ui_ok 'ログインしました' "$effective_profile"
+}
+
+run_mfa_login() {
+  # help だけ実行して対応の有無を確かめる。ここでは認証情報を取得しない。
+  aws configure mfa-login help >/dev/null 2>&1 ||
+    fail 'mfa-login のヘルプを実行できません。AWS CLI のバージョンとヘルプ表示環境を確認してください。'
+
+  local options=(--serial-number "$mfa_serial" --update-profile "$output_profile")
+  if [[ -n "$duration" ]]; then
+    options+=(--duration-seconds "$duration")
+  fi
+
+  # 出力は端末に流しつつ控えを取り、有効期限の行だけ保存先に書き残す。
+  # AWS CLI は MFA の一時認証情報に期限を保存しないため、後から参照できるのはこの控えだけ。
+  local output_log expiration
+  output_log=$(mktemp "${TMPDIR:-/tmp}/aws-login.XXXXXX")
+  aws configure mfa-login --profile "$profile" "${common_options[@]}" "${options[@]}" 2>&1 |
+    tee "$output_log" >&2
+  local status=${PIPESTATUS[0]}
+  expiration=$(sed -nE 's/.*Credentials will expire at ([0-9]{4}-[0-9]{2}-[0-9]{2}) ([0-9]{2}:[0-9]{2}:[0-9]{2}) UTC.*/\1T\2Z/p' "$output_log" | head -n1)
+  rm -f "$output_log"
+  (( status == 0 )) || return "$status"
+
+  if [[ -n "$expiration" ]]; then
+    aws configure set "$expiration_key" "$expiration" --profile "$output_profile"
+  fi
+}
+
+
+#--- 有効期限 -----------------------------------------------------------------
+
+# MFA の期限を保存する項目名。AWS CLI 自身は読まないので、このスクリプト専用の控え。
+expiration_key=aws_credential_expiration
+
+# ISO 8601 の日時を UTC の epoch 秒に変換する。GNU date と BSD date の両方に対応する。
+iso_to_epoch() {
+  local iso=$1 base rest offset=0 sign hours minutes epoch
+  base=${iso:0:19}
+  rest=$(printf '%s' "${iso:19}" | sed -E 's/^\.[0-9]+//')
+  case "$rest" in
+    ''|Z) ;;
+    [+-][0-9][0-9]:[0-9][0-9])
+      sign=${rest:0:1} hours=${rest:1:2} minutes=${rest:4:2}
+      offset=$(( 10#$hours * 3600 + 10#$minutes * 60 ))
+      [[ "$sign" == - ]] && offset=$(( -offset ))
+      ;;
+    *) return 1 ;;
+  esac
+  epoch=$(date -u -d "${base}Z" +%s 2>/dev/null) ||
+    epoch=$(date -u -j -f '%Y-%m-%dT%H:%M:%S' "$base" +%s 2>/dev/null) ||
+    return 1
+  printf '%s\n' "$(( epoch - offset ))"
+}
+
+# epoch 秒をローカル時刻の表示にする。
+epoch_to_local() {
+  local epoch=$1
+  date -d "@$epoch" '+%Y-%m-%d %H:%M %Z' 2>/dev/null ||
+    date -r "$epoch" '+%Y-%m-%d %H:%M %Z' 2>/dev/null
+}
+
+# 接続に使う認証情報の有効期限を ISO 8601 で返す。分からなければ空。
+get_expiration() {
+  if [[ "$mode" == mfa ]]; then
+    config_get "$expiration_key" "$effective_profile"
+    return 0
+  fi
+  aws configure export-credentials --profile "$effective_profile" \
+      "${common_options[@]}" --output json 2>/dev/null |
+    sed -nE 's/.*"Expiration": *"([^"]+)".*/\1/p' | head -n1 || true
+}
+
+# 有効期限と残り時間を表示する。期限が分からない場合は何も表示しない。
+report_expiration() {
+  local expiration epoch now remaining
+  expiration=$(get_expiration)
+  [[ -n "$expiration" ]] || return 0
+  epoch=$(iso_to_epoch "$expiration") || return 0
+  now=$(date +%s)
+  remaining=$(( epoch - now ))
+
+  if (( remaining <= 0 )); then
+    ui_kv '有効期限' "${c_yellow}$(epoch_to_local "$epoch")  期限切れの可能性があります${c_reset}"
+  else
+    ui_kv '有効期限' "$(epoch_to_local "$epoch")  ${c_dim}残り $(( remaining / 3600 )) 時間 $(( remaining % 3600 / 60 )) 分${c_reset}"
+  fi
+}
+
+
+#--- 結果の表示と後続コマンド -------------------------------------------------
+
+# 接続に使うプロファイルと、STS が返した身元を並べて表示する。
+report_identity() {
+  local account arn
+  account=$(printf '%s\n' "$identity" | sed -nE 's/.*"Account": *"([^"]*)".*/\1/p' | head -n1)
+  arn=$(printf '%s\n' "$identity" | sed -nE 's/.*"Arn": *"([^"]*)".*/\1/p' | head -n1)
+
+  ui_kv '接続プロファイル' "${effective_profile} (${mode})"
+  if [[ -n "$arn" ]]; then
+    ui_kv 'アカウント' "$account"
+    ui_kv 'ARN' "$arn"
+  else
+    ui_raw "$identity"
+  fi
+  report_expiration
+}
+
+# 認証済みプロファイルを渡して後続コマンドに置き換わる。指定がなければ使い方を表示する。
+run_command_or_show_hint() {
+  if (( ${#command_args[@]} == 0 )); then
+    show_command_hint
+    return 0
+  fi
+
+  export AWS_PROFILE="$effective_profile" AWS_DEFAULT_PROFILE="$effective_profile"
+  if [[ -n "$region" ]]; then
+    export AWS_REGION="$region" AWS_DEFAULT_REGION="$region"
+  fi
+
+  exec "${command_args[@]}"
+}
+
+# 使い方の案内だけは標準出力に出す。標準出力が端末でなければ色を付けない。
+# 色の変数はここだけローカルに差し替える（hint_cmd からも動的スコープで見える）。
+# グローバルを空にすると、この後に fail が呼ばれたとき赤の開始コードだけが残る。
+show_command_hint() {
+  local c_bold=$c_bold c_dim=$c_dim c_cyan=$c_cyan c_green=$c_green c_reset=$c_reset
+  [[ -t 1 ]] || c_bold='' c_dim='' c_cyan='' c_green='' c_reset=''
+  printf '  %s✔%s %s%s%s%s\n' "$c_green" "$c_reset" "$(ui_pad '認証済み')" "$c_bold" "$effective_profile" "$c_reset"
+  printf '  %s次に打つコマンド%s\n' "$c_bold" "$c_reset"
+  hint_cmd "aws --profile $(printf '%q' "$effective_profile") s3 ls" 'このプロファイルで直接使う'
+  hint_cmd "${0##*/} --profile $(printf '%q' "$profile") -- aws s3 ls" 'ログインを確かめてから実行する'
+}
+
+hint_cmd() {
+  printf '    %s%-40s%s  %s%s%s\n' "$c_cyan" "$1" "$c_reset" "$c_dim" "$2" "$c_reset"
+}
+
+
+#--- 全体の流れ ---------------------------------------------------------------
+
+main() {
+  parse_arguments "$@"
+
+  command -v aws >/dev/null 2>&1 || fail 'AWS CLI v2 をインストールしてください。'
+  isolate_credentials
+  ui_title 'aws-login'
+
+  resolve_profile
+  # 明示された SSO の対象を確定してから設定を読む。元の MFA 設定とは混在させない。
+  apply_sso_suffix
+  load_profile_settings
+  resolve_mode
+  (( asked_profile == 0 )) || ui_ok '対象プロファイル' "$profile"
+
+  if [[ "$mode" == sso ]]; then
+    prepare_sso
+  else
+    prepare_mfa
+  fi
+
+  region=${region:-$(config_get region "$profile")}
+  if [[ -n "$region" ]]; then
+    common_options=(--region "$region")
+  fi
+
+  verify_current_identity
+  login_if_needed
+  report_identity
+
+  run_command_or_show_hint
+}
+
+main "$@"

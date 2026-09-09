@@ -1,0 +1,3 @@
+# aws-login
+
+@AGENTS.md

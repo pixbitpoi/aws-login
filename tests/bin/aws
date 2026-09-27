@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+#
+# 疑似 AWS CLI。テストからのみ使う。実際の AWS API や ~/.aws は触らない。
+#
+# 動作は次の環境変数で決まる（tests/lib/helpers.sh が設定する）。
+#   AWS_MOCK_DIR          作業ディレクトリ
+#                           $AWS_MOCK_DIR/log          呼び出しログ（1 行 1 呼び出し）
+#                           $AWS_MOCK_DIR/profiles/N   プロファイル N の key=value
+#                           $AWS_MOCK_DIR/sessions/N   N がログイン済みであることの印
+#   AWS_MOCK_STS_ERROR    未ログインのプロファイルに対して sts が返すエラー本文
+#                           空なら常にログイン済みとして扱う
+#   AWS_MOCK_LOGIN_EXIT   sso login / mfa-login の終了コード（既定 0）
+#   AWS_MOCK_NO_MFA_LOGIN 1 なら configure mfa-login を未対応として扱う
+#   AWS_MOCK_EXPIRATION   ログインで得た認証情報の期限（UTC、"YYYY-MM-DD HH:MM:SS"）
+set -euo pipefail
+
+profiles_dir=$AWS_MOCK_DIR/profiles
+sessions_dir=$AWS_MOCK_DIR/sessions
+mkdir -p "$profiles_dir" "$sessions_dir"
+
+printf '%s\n' "$*" >> "$AWS_MOCK_DIR/log"
+
+# 呼び出し元の認証情報が漏れていれば、その場で失敗させる。
+for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN; do
+  if [[ -n "${!name:-}" ]]; then
+    printf '%s が解除されていません\n' "$name" >&2
+    exit 90
+  fi
+done
+
+# 値を伴うオプションと、それ以外の位置引数を分けて読む。
+declare -A option=()
+words=()
+while (( $# )); do
+  case "$1" in
+    --profile|--region|--output|--serial-number|--update-profile|--duration-seconds)
+      option[$1]=${2:-}
+      shift 2
+      ;;
+    --*)
+      option[$1]=1
+      shift
+      ;;
+    *)
+      words+=("$1")
+      shift
+      ;;
+  esac
+done
+
+profile=${option[--profile]:-}
+
+config_get() {
+  local key=$1 file=$profiles_dir/$2
+  [[ -f "$file" ]] || return 1
+  local line
+  line=$(grep -m1 "^$key=" "$file") || return 1
+  printf '%s\n' "${line#*=}"
+}
+
+config_set() {
+  local key=$1 value=$2 file=$profiles_dir/$3
+  touch "$file"
+  grep -v "^$key=" "$file" > "$file.tmp" || true
+  printf '%s=%s\n' "$key" "$value" >> "$file.tmp"
+  mv "$file.tmp" "$file"
+}
+
+login_exit=${AWS_MOCK_LOGIN_EXIT:-0}
+expiration=${AWS_MOCK_EXPIRATION:-2099-01-01 00:00:00}
+command=${words[0]:-}
+subcommand=${words[1]:-}
+
+case "$command:$subcommand" in
+  'configure:get')
+    config_get "${words[2]}" "$profile"
+    ;;
+
+  'configure:list-profiles')
+    ls "$profiles_dir"
+    ;;
+
+  'configure:set')
+    config_set "${words[2]}" "${words[3]}" "$profile"
+    ;;
+
+  'configure:')
+    # アクセスキーを尋ねるウィザード。入力されたものとして保存する。
+    config_set aws_access_key_id wizard-key "$profile"
+    config_set aws_secret_access_key wizard-secret "$profile"
+    ;;
+
+  'configure:sso')
+    # SSO 設定ウィザード。セッション参照を保存する。
+    config_set sso_session wizard-session "$profile"
+    ;;
+
+  'configure:mfa-login')
+    # help だけの呼び出しは対応状況の確認。認証は行わない。
+    if [[ ${words[2]:-} == help ]]; then
+      [[ ${AWS_MOCK_NO_MFA_LOGIN:-0} == 0 ]] || exit 252
+      printf 'usage: aws configure mfa-login\n'
+      exit 0
+    fi
+    (( login_exit == 0 )) || exit "$login_exit"
+    output=${option[--update-profile]:-$profile}
+    config_set aws_access_key_id mfa-key "$output"
+    config_set aws_session_token mfa-session "$output"
+    touch "$sessions_dir/$output"
+    printf 'Credentials will expire at %s UTC\n' "$expiration"
+    ;;
+
+  'configure:export-credentials')
+    if [[ -n "${AWS_MOCK_STS_ERROR:-}" && ! -f "$sessions_dir/$profile" ]]; then
+      printf 'Unable to retrieve credentials\n' >&2
+      exit 255
+    fi
+    printf '{"Version": 1, "AccessKeyId": "ASIAEXAMPLE", "Expiration": "%sT%s+00:00"}\n' \
+      "${expiration% *}" "${expiration#* }"
+    ;;
+
+  'sso:login')
+    (( login_exit == 0 )) || exit "$login_exit"
+    touch "$sessions_dir/$profile"
+    ;;
+
+  'sts:get-caller-identity')
+    if [[ -n "${AWS_MOCK_STS_ERROR:-}" && ! -f "$sessions_dir/$profile" ]]; then
+      printf '%s\n' "$AWS_MOCK_STS_ERROR" >&2
+      exit 255
+    fi
+    printf '{"Account":"123456789012","Arn":"arn:aws:iam::123456789012:user/test"}\n'
+    ;;
+
+  *)
+    printf '想定外の呼び出し: %s\n' "${words[*]}" >&2
+    exit 91
+    ;;
+esac
